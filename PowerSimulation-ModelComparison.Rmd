@@ -1,5 +1,5 @@
 ---
-title: "Power simulation/ MSE / Bayes Factor"
+title: "Power simulation/ model comparison MSE & Bayes Factor"
 author: "Butovens Médé"
 date: "4/20/2021"
 output:

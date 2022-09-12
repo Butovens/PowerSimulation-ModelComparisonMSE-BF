@@ -12,6 +12,7 @@ output:
 knitr::opts_chunk$set(echo = TRUE)
 
 ### Import libraries
+# install.packages("tidyverse", "dplyr", "skimr", "brms", "tidybayes", "broom", "modelr", "tictoc")
 library(tidyverse)
 library(dplyr)
 library(skimr)

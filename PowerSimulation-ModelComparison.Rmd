@@ -1,0 +1,646 @@
+---
+title: "Power simulation/ MSE / Bayes Factor"
+author: "Butovens Médé"
+date: "4/20/2021"
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+### Import libraries
+library(tidyverse)
+library(dplyr)
+library(skimr)
+library(brms)
+library(tidybayes)
+library(broom)
+library(modelr)
+library(tictoc)
+```
+
+# 1: Power simulation
+```{r}
+### Test Simulation 
+
+### For reproducibility
+set.seed(210)
+
+### Coefficients in odds and odds ratio
+b0 <- 0.42
+b1 <- 1.05
+
+### Draw 100 values from a uniform distribution that ranges in value from 10 to 60. (Not sure here how to simulate participants who pictures for amounts time 10, 20, 30, 40, 50 or 60 seconds)
+Time <- runif(100, 10, 60)
+
+### Center Time variable
+# Time.c <- scale(Time, center = T, scale = F)
+
+### The change in log odds per unit change in the predictors
+z <- log(b0) + log(b1) * Time
+
+### Probability using logistic regression (and inverse logit link function)
+logit_p <- 1 / (1 + exp(-z))
+
+### Second method to compute probabilities using logistic regression 
+# plogis(z)
+
+### Occurrence and non-occurrence of recalling pictures based on previously computed probabilities 
+y <- rbinom(100, 1, logit_p)
+
+### Logistic regression
+model <- glm(formula = y ~ Time,
+    family = binomial(link = "logit"))
+
+### Actual Simulation 
+### Create function to run simulation:
+log_simFit <- function(sample_size, b0, b1, sig = 0.05) { # Function takes 'n' samples, coefficient for odds b0 and b1, and significance value alpha
+  Time <- runif(sample_size, 10,60) # Sample "n" times in randomly uniform distribution from 10 to 60
+  # Time.c <- scale(Time, center = T, scale = F) # center the values (by subtracting mean but not standardizing)
+  z <- log(b0) + log(b1) * Time # Change in log odds per unit change in time (i.e. second)
+  logit_p <- 1 / (1 + exp(-z)) # Transform log adds to probabilities
+  y_bin <- rbinom(n = sample_size, size = 1, prob = logit_p) # Bernouilli trials with 'n' observations and probability p for each observation 
+  model <- glm(formula = y_bin ~ Time,family = binomial(link = "logit")) # Model the data
+  sig_out <- tidy(model)$p.value[2] < sig # Is p value for b1 < significance level?
+}
+
+### Create power estimate function
+# Function takes number of simulation, sample size, intercept, and slope in odds, and significance value
+power_est <- function(n_sim, sample_size, b0, b1, sig = 0.05) {
+  # run the "expression'/function "n_sim" times and save those repetitions in an object (in the form of an array)
+  rep_out <- replicate(n = n_sim, expr = log_simFit(sample_size, b0, b1))
+  # Average the values in the array
+  mean(rep_out)
+}
+
+### Test power estimate function
+power_est(n_sim = 100, 
+          sample_size = 20,
+          b0 = 0.42, 
+          b1 = 1.05)
+
+### Create sequence of multiple sample sizes
+mult_sample_size <- seq(20, 200, 10)
+
+### Run the simulation
+# Apply the created power estimate function to the different sample sizes
+power_est_sim <- sapply(mult_sample_size, function(x)power_est(n_sim = 200,
+                                                               sample_size = x, 
+                                                               b0 = 0.42, 
+                                                               b1 = 1.05))
+### Create data frame
+dat <- tibble(sample_size = mult_sample_size, 
+              power = power_est_sim)
+
+### Plot Power in function of sample size
+ggplot(data = dat, aes(x = sample_size,
+                       y = power)) +
+  geom_point() +
+  labs(title = "Simulated power across sample size",
+       x = "Sample size",
+       y = "Power") +
+  geom_smooth(aes(x = sample_size, 
+                  y = power),
+              method = "loess") +
+  theme_bw() +
+  theme(text = element_text(size = 12))
+
+### Minimum number of subjects to run to have a 80% power to detect effect of hypothesis 
+dat %>% 
+  filter(power > 0.8)
+```
+* We should run 90 subjects  
+
+*Note: Samples of 10 created convergence errors from time to time so the simulation was started with a sample of 20. [Here is a possible explanation for the error message](https://stats.stackexchange.com/questions/336424/issue-with-complete-separation-in-logistic-regression-in-r)*
+
+# 2: Model comparison MSE
+```{r}
+### Load data
+rts_dat <- read_csv(file.choose()) # Choose rts.csv file
+
+### Keep first 200 rows of data
+rts_dat_smol <- sample_n(rts_dat, 200)
+
+### Skim data set
+skim(rts_dat_smol)
+
+### Change Age subject variable from character to factor
+rts_dat_smol$AgeSubject <- as_factor(rts_dat_smol$AgeSubject) 
+
+### Check factor contrast
+rts_dat_smol$AgeSubject %>% contrasts()
+
+### Time cross validation
+tic("Start LOO")
+### Cross validation WITHOUT interaction and correlations between predictor variables
+rts_cross_val <- rts_dat_smol %>% 
+  # Select needed variables
+  select(RTnaming, AgeSubject, WrittenFrequency , MeanBigramFrequency, FamilySize, InflectionalEntropy) %>%
+  # Use the leave one out cross validation
+  crossv_loo() %>% 
+  # Create columns where a specific model is applied to the trained data sets created by the leave-one-out function
+  mutate(m1 = map(train, ~ lm(RTnaming ~ 1 + AgeSubject, data = .)),  # Note: data argument gets '.' i.e. the data passed down from the crossv_loo. It does not get the original data set i.e. rts_dat_smol  
+         m2 = map(train, ~ lm(RTnaming ~ 1 + AgeSubject + WrittenFrequency, data = .)),
+         m3 = map(train, ~ lm(RTnaming ~ 1 + AgeSubject + WrittenFrequency + MeanBigramFrequency, data = .)),
+         m4 = map(train, ~ lm(RTnaming ~ 1 + AgeSubject + WrittenFrequency + MeanBigramFrequency + FamilySize, data = .)),
+         m5 = map(train, ~ lm(RTnaming ~ 1 + AgeSubject + WrittenFrequency + MeanBigramFrequency + FamilySize + InflectionalEntropy, data = .))) %>% 
+  # Pivot table
+  pivot_longer(cols = c(m1 ,m2 ,m3 ,m4 ,m5),
+               names_to = "model",
+               values_to = "fit") %>% 
+  # Create column that computes the MSE from the fitted values and TRAINED data sets created by the leave-one-out function 
+  mutate(mse_train = map2_dbl(.x = fit, .y = train, ~ mse(.x, .y))) %>% 
+  # Create column that computes the MSE from the fitted values and TEST data sets created by the leave-one-out function
+  mutate(mse_test = map2_dbl(.x = fit, .y = test, ~ mse(.x, .y)))
+### Time cross validation
+toc()
+
+### Average MSE for each model without interaction
+rts_cross_val_tbl <- rts_cross_val %>% 
+  # Group by model
+  group_by(model) %>% 
+  # Summarize mean mse by model for training and test data sets
+  summarize(mean_mse_train = mean(mse_train) %>% round(6),
+            mean_mse_test = mean(mse_test) %>% round(6)) %>% 
+  ungroup()
+
+### Result
+rts_cross_val_tbl
+
+### Time elapsed: cross validation
+tic("Start LOO")
+### Cross validation WITH interaction and correlations between predictor variables
+rts_cross_val_cor <- rts_dat_smol %>% 
+  select(RTnaming, AgeSubject, WrittenFrequency , MeanBigramFrequency, FamilySize, InflectionalEntropy) %>%
+  crossv_loo() %>% 
+  mutate(m1 = map(train, ~ lm(RTnaming ~ 1 + AgeSubject, data = .)),
+         m2 = map(train, ~ lm(RTnaming ~ 1 + AgeSubject * WrittenFrequency, data = .)),
+         m3 = map(train, ~ lm(RTnaming ~ 1 + AgeSubject * WrittenFrequency * MeanBigramFrequency, data = .)),
+         m4 = map(train, ~ lm(RTnaming ~ 1 + AgeSubject * WrittenFrequency * MeanBigramFrequency * FamilySize, data = .)),
+         m5 = map(train, ~ lm(RTnaming ~ 1 + AgeSubject * WrittenFrequency * MeanBigramFrequency * FamilySize * InflectionalEntropy, data = .))) %>% 
+  pivot_longer(cols = c(m1 ,m2 ,m3 ,m4 ,m5),
+               names_to = "model",
+               values_to = "fit") %>% 
+  mutate(mse_train = map2_dbl(.x = fit, .y = train, ~ mse(.x, .y))) %>% 
+  mutate(mse_test = map2_dbl(.x = fit, .y = test, ~ mse(.x, .y)))
+### Time elapsed: cross validation
+toc()
+
+
+### Average MSE for each model with interactions
+rts_cross_val_cor_tbl <- rts_cross_val_cor %>%
+  group_by(model) %>% 
+  summarize(mean_mse_train = mean(mse_train) %>% round(6),
+            mean_mse_test = mean(mse_test) %>% round(6)) %>% 
+  ungroup()
+
+### Result
+rts_cross_val_cor_tbl
+```
+
+## A)
+
+* When doing leave one out cross validation it appears that mean train MSE and mean test MSE are similar. They are on the same order of magnitude. This tell us that on average the models tested do as good of job at predicting the "left out" data point as explaining / capturing the variance of the "training" data set. We may start to worry if the MSE for the test data point was much higher than the one for the trained data set. That could indicate potential overfitting of the data.
+
+## B)
+```{r}
+### Create models with NO interaction
+m1 = lm(RTnaming ~ 1 + AgeSubject, data = rts_dat_smol) %>% glance() 
+m2 = lm(RTnaming ~ 1 + AgeSubject + WrittenFrequency, data = rts_dat_smol) %>% glance() 
+m3 = lm(RTnaming ~ 1 + AgeSubject + WrittenFrequency + MeanBigramFrequency, data = rts_dat_smol) %>% glance() 
+m4 = lm(RTnaming ~ 1 + AgeSubject + WrittenFrequency + MeanBigramFrequency + FamilySize, data = rts_dat_smol) %>% glance()
+m5 = lm(RTnaming ~ 1 + AgeSubject + WrittenFrequency + MeanBigramFrequency + FamilySize + InflectionalEntropy, data = rts_dat_smol) %>% glance() 
+
+### Create models WITH interaction
+m1_cor = lm(RTnaming ~ 1 + AgeSubject, data = rts_dat_smol) %>% glance()
+m2_cor = lm(RTnaming ~ 1 + AgeSubject * WrittenFrequency, data = rts_dat_smol) %>% glance() 
+m3_cor = lm(RTnaming ~ 1 + AgeSubject * WrittenFrequency * MeanBigramFrequency, data = rts_dat_smol) %>% glance() 
+m4_cor = lm(RTnaming ~ 1 + AgeSubject * WrittenFrequency * MeanBigramFrequency * FamilySize, data = rts_dat_smol) %>% glance() 
+m5_cor = lm(RTnaming ~ 1 + AgeSubject * WrittenFrequency * MeanBigramFrequency * FamilySize * InflectionalEntropy, data = rts_dat_smol) %>% glance() 
+
+
+### Create summary table with information criteria
+table <- bind_rows(m1, m2, m3, m4, m5) %>% round(2)
+table <- bind_cols(tibble(models = c("m1", "m2", "m3", "m4", "m5")),
+                   table,
+                   rts_cross_val_tbl[3]) %>% 
+  select(models, AIC, BIC, logLik, df, r.squared, mean_mse_test) %>% 
+  arrange(BIC)
+
+### Result
+table
+
+### Create summary table with information criteria for model with interaction
+table_cor <- bind_rows(m1_cor, m2_cor, m3_cor, m4_cor, m5_cor) %>% round(2)
+table_cor <- bind_cols(tibble(models = c("m1_cor", "m2_cor", "m3_cor", "m4_cor", "m5_cor")),
+                   table_cor,
+                   rts_cross_val_cor_tbl[3]) %>% 
+  select(models, AIC, BIC, logLik, df, r.squared, mean_mse_test) %>% 
+  arrange(BIC)
+
+### Result
+table_cor
+
+### Combined table results
+bind_rows(table, table_cor) %>% 
+  arrange(BIC) %>% 
+  kableExtra::kbl(caption = "Information criteria and MSE for RT-namings models without and with interaction of predictor variables") %>% 
+  kableExtra::kable_classic(full_width = F, html_font = "Cambria")
+```
+
+
+* Given the information criteria, the r-squared and MSE I would use model m4 (with no interaction) to make inference about RTnaming. This model has the lowest AIC, BIC, and MSE of all the models. 
+
+
+# 3: Model comparison Bayes Factor
+## A)
+```{r}
+### Plot of RTnaming as a function of AgeSubject and WrittenFrequency
+ggplot(data = rts_dat, aes(x = WrittenFrequency, y = RTnaming, color = AgeSubject)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  labs(title = "RTnaming as a function of AgeSubject and WrittenFrequency",
+       x = "Written Frequency by age",
+       y = "RTnaming") +
+  theme_bw() +
+  theme(text = element_text(size = 12))
+
+```
+
+## B)
+###### Creation of prior predictives and simulation
+We know that in our experiment 'Response Time' has a lower boundary of 0 and is unlikely to be above a minute. In addition, we will assume that this type of response is positively skewed. Thus RT observations may be drawn from a lognormal distribution. The change in response time can be positive or negative but smaller than the overall average response time. Finally, aside from being positive, we don't want to make a big assumption about the variance (or noise) in the data.  
+
+ * For our models we have the likelihood being:          
+ 
+ $$ RTnaming_i \sim N(\mu_i, \sigma) $$
+ 
+**Note: Even if (reaction time might not follow a standard normal distribution)[https://lindeloev.github.io/shiny-rt/#:~:text=In%20most%20cases%2C%20the%20normal,the%20fastest%20RT%20ever%20recorded!], we will model it using a normal distribution for simplicity.**
+
+
+With linear model 1 being: 
+ 
+ $$\mu_i = \beta0 + \beta1 * AgeSubject_i + \beta2 * WrittenFrequency_i $$
+ 
+linear model 2 being:
+ 
+  $$\mu_i = \beta0 + \beta1 * AgeSubject_i + \beta2 * WrittenFrequency_i + \beta3 * AgeSubject_i * WrittenFrequency_i$$
+ 
+and priors being:
+
+* $\beta0 \sim lognorm (2, 1)$
+* $\beta1 \sim N (4, 2)$
+* $\beta2 \sim N (4, 2)$
+* $\beta3 \sim N (4, 2)$ for model linear model 2
+* $\sigma \sim N_+ (3, 2)$
+  
+```{r}
+### Simulate prior predictive distributions for prior predictive check model 1
+# Number of samples
+nsamples <- 1000
+# Vector of a 1000 randomly sampled beta 0s from lognormal dist 2,1
+beta0s <- rlnorm(nsamples, 2, 1)
+# Vector of a 1000 randomly sampled beta 1s from normal dist 4,2
+beta1s <- rnorm(nsamples, 4, 2)
+# Vector of a 1000 randomly sampled beta 2s from normal dist 4,2
+beta2s <- rnorm(nsamples, 4, 2)
+# Vector of a 1000 randomly sampled sigmas from uniform dist 0,5
+# sigmas <- runif(nsamples, 0, 5)
+# Vector of a 1000 randomly sampled sigmas from truncated normal dist 3,2
+sigmas <- extraDistr::rtnorm(nsamples, 3, 2, a = 0, b = Inf)
+# Empty vector used to save data predictions 
+rt_pred <- NULL
+
+# Loop through betas and sigmas parameters
+for (i in 1:nsamples) {
+  # Save a randomly sampled beta 0 in an object 
+  b0 <- beta0s[i]
+  # Save a randomly sampled beta 1 in an object
+  b1 <- beta1s[i]
+  # Save a randomly sampled beta 2 in an object
+  b2 <- beta2s[i]
+  # Save a randomly sampled sigma in an object
+  sigma <- sigmas[i]
+  # Empty vector to save the means "mu" (empty vector might not be necessary here)
+  # mu <- NULL
+  for (j in sample(rts_dat$WrittenFrequency, 100)) { # Simulation reduced to sampling 100 obs from original data as opposed to 4568 to reduce computing time
+    # Compute mean mu based on randomly sampled values from beta0,1,2  
+    mu <- b0 + b1*j + b2*j
+    # Use computed "mu" and sampled sigma value to sample a predicted observation from distribution with mean "mu' and sd sigma
+    rt_pred <- c(rt_pred, rnorm(1, mu, sigma))
+  }
+}
+
+# Create data frame with predicted values and iteration number
+prior_pred_mod1 <- tibble(rt = rt_pred, iter = rep(1:nsamples, each = 100))
+
+### Look at sample distribution for prior predictive from some iteration cases  
+ggplot(prior_pred_mod1 %>% filter(iter >12 & iter < 25)) +
+  geom_histogram(aes(x = rt)) +
+  facet_wrap(~iter) +
+  theme_bw()
+
+### Create the mean of the aggregate prior predictive
+prior_pred_sum_mod1 <- prior_pred_mod1 %>% 
+  group_by(iter) %>% 
+  summarize(mean_RT = mean(rt)) %>% 
+  ungroup()
+
+### Plot the mean of the aggregate prior predictive
+ggplot(prior_pred_sum_mod1) +
+  # geom_density(aes(x = mean_RT))
+  geom_histogram(aes(x = mean_RT), binwidth = 5, fill = "#0c4c8a") 
+
+
+### Prior predictive check method 2:
+# Change AgeSubject to factor
+rts_dat$AgeSubject <- as_factor(rts_dat$AgeSubject) 
+
+# Check contrasts
+contrasts(rts_dat$AgeSubject)
+
+# Set effect coding 
+contrasts(rts_dat$AgeSubject) <- c(-0.5,0.5)
+
+# Center WrittenFrequency variable
+rts_dat <- rts_dat %>% mutate(WrittenFrequency.c = WrittenFrequency - mean(WrittenFrequency))
+
+# Create priors for prior predictive check
+priors <- c(prior(lognormal(2, 1), class = Intercept),
+            # Because both b1 & b2 have the same prior parameters, we don't need to specify a specific prior for both with the "coef" argument
+            prior(normal(4, 2), class = b),
+            # prior(normal(4, 2), class = b, coef = AgeSubject), # Note: Throws error message "Error: The following priors do not correspond to any model parameter: b_AgeSubject ~ normal(4, 2) Function 'get_prior' might be helpful to you." when AgeSubject included
+            # prior(normal(4, 2), class = b, coef = WrittenFrequency.c),
+            prior(normal(3, 2), class = sigma)
+            ) 
+
+# Create model for Prior predictive check
+mod1_priors <- brm(RTnaming ~ 1 + AgeSubject + WrittenFrequency.c, data = rts_dat,
+                   family = gaussian(),
+                   prior = priors,
+                   sample_prior = "only",
+                   iter = 2000,
+                   chains = 4,
+                   cores = 4,
+                   warmup = 1000,
+                   file = "mod1_priors")
+
+# Plot prior predictive check for model 1
+pp_check(mod1_priors, type = "dens_overlay", nsamples = 50)
+```
+
+
+```{r}
+### Simulate prior predictive distributions for prior predictive check model 2
+nsamples <- 1000
+beta0s <- rlnorm(nsamples, 2, 1)
+beta1s <- rnorm(nsamples, 4, 2)
+beta2s <- rnorm(nsamples, 4, 2)
+beta3s <- rnorm(nsamples, 4, 2)
+sigmas <- extraDistr::rtnorm(nsamples, 3, 2, a = 0, b = Inf)
+rt_pred <- NULL
+
+for (i in 1:nsamples) {
+  b0 <- beta0s[i]
+  b1 <- beta1s[i]
+  b2 <- beta2s[i]
+  b3 <- beta3s[i]
+  sigma <- sigmas[i]
+  mu <- NULL
+  for (j in sample(rts_dat$WrittenFrequency.c, 100)) {
+    mu <- b0 + b1*j + b2*j + b3*j
+    rt_pred <- c(rt_pred, rnorm(1, mu, sigma))
+  }
+}
+
+prior_pred_mod2 <- tibble(rt = rt_pred, iter = rep(1:nsamples, each = 100))
+
+### Look at sample distribution for prior predictive from some iteration cases  
+ggplot(prior_pred_mod2 %>% filter(iter >12 & iter < 25)) +
+  geom_histogram(aes(x = rt)) +
+  facet_wrap(~iter) +
+  theme_bw()
+
+### Create the mean of the aggregate prior predictive
+prior_pred_sum_mod2 <- prior_pred_mod1 %>% 
+  group_by(iter) %>% 
+  summarize(mean_RT = mean(rt)) %>% 
+  ungroup()
+
+### Plot the mean of the aggregate prior predictive
+ggplot(prior_pred_sum_mod2) +
+  # geom_density(aes(x = mean_RT))
+  geom_histogram(aes(x = mean_RT), binwidth = 5, fill = "#0c4c8a") 
+
+
+#### Prior predictive check method 2: 
+# Create model for Prior predictive check using ppcheck function
+mod2_priors <- brm(RTnaming ~ 1 + AgeSubject * WrittenFrequency.c, data = rts_dat,
+  # brm(RTnaming ~ 1 + AgeSubject + WrittenFrequency.c + AgeSubject:WrittenFrequency.c, data = rts_dat,
+                   family = gaussian(),
+                   prior = priors,
+                   sample_prior = "only",
+                   iter = 2000,
+                   chains = 4,
+                   cores = 4,
+                   warmup = 1000,
+                   file = "mod2_priors")
+
+# Plot prior predictive check for model 2
+pp_check(mod2_priors, type = "dens_overlay", nsamples = 50)
+```
+**Prior encode assumption about what data we expect to see without having see the data i.e. what values are possible**
+
+* Here both prior predictive checks for the two models have values that are mostly plausible (although there are some negative values that are impossible)
+
+```{r}
+### Method 1: Posterior predictive check model 1 (using ppcheck)
+mod1 <- brm(RTnaming ~ 1 + AgeSubject + WrittenFrequency.c, data = rts_dat,
+                   family = gaussian(),
+                   prior = priors,
+                   iter = 2000,
+                   chains = 4,
+                   cores = 4,
+                   warmup = 1000,
+                   file = "mod1")
+
+### distribution for estimates
+plot(mod1)
+
+### Plot prior predictive check for model 1
+pp_check(mod1, type = "dens_overlay", nsamples = 50)
+
+### Method 2: Simulate prediction from the posterior
+### Simulate posterior predictive distributions for posterior predictive check model 1
+nsamples <- 1000
+beta0s <- posterior_samples(mod1)$b_Intercept
+beta1s <- posterior_samples(mod1)$b_AgeSubject
+beta2s <- posterior_samples(mod1)$b_WrittenFrequency.c
+sigmas <- posterior_samples(mod1)$sigma
+rt_pred <- NULL
+
+for (i in 1:nsamples) {
+  b0 <- beta0s[i]
+  b1 <- beta1s[i]
+  b2 <- beta2s[i]
+  sigma <- sigmas[i]
+  mu <- NULL
+  for (j in sample(rts_dat$WrittenFrequency.c, 100)) {
+    mu <- b0 + b1*j + b2*j 
+    rt_pred <- c(rt_pred, rnorm(1, mu, sigma))
+  }
+}
+
+post_pred_mod1 <- tibble(rt = rt_pred, iter = rep(1:nsamples, each = 100))
+
+### Plot posterior predictive 
+ggplot(post_pred_mod1 %>% filter(iter < 50)) +
+  geom_density(aes(x = rt, group = iter)) + 
+  theme_bw()
+
+```
+
+**Note: The simulation doesn't seem to capture the bimodality of the data as well as ppcheck**
+
+
+```{r}
+### Method 1: Posterior predictive check model 2 (using ppcheck)
+mod2 <- brm(RTnaming ~ 1 + AgeSubject * WrittenFrequency.c, data = rts_dat,
+                   family = gaussian(),
+                   prior = priors,
+                   iter = 2000,
+                   chains = 4,
+                   cores = 4,
+                   warmup = 1000)
+                   # file = "mod2")
+
+### distribution for estimates
+plot(mod2)
+
+# Plot prior predictive check for model 2
+pp_check(mod2, type = "dens_overlay", nsamples = 50)
+
+### Method 2: Simulate prediction from the posterior (doesn't work, will come back to it later)
+### Simulate posterior predictive distributions for posterior predictive check model 2
+# nsamples <- 1000
+# beta0s <- posterior_samples(mod2)$b_Intercept
+# beta1s <- posterior_samples(mod2)$b_AgeSubject
+# beta2s <- posterior_samples(mod2)$WrittenFrequency.c
+# beta3s <- posterior_samples(mod2)$b_AgeSubject:b_WrittenFrequency.c # we get: Error: object 'WrittenFrequency.c' not found
+# sigmas <- posterior_samples(mod2)$sigma
+# rt_pred <- NULL
+# 
+# for (i in 1:nsamples) {
+#   b0 <- beta0s[i]
+#   b1 <- beta1s[i]
+#   b2 <- beta2s[i]
+#   b3 <- beta3s[i]
+#   sigma <- sigmas[i]
+#   mu <- NULL
+#   for (j in sample(rts_dat$WrittenFrequency.c, 100)) {
+#     mu <- b0 + b1*j + b2*j + b3*j
+#     rt_pred <- c(rt_pred, rnorm(1, mu, sigma))
+#   }
+# }
+# 
+# post_pred_mod2 <- tibble(rt = rt_pred, iter = rep(1:nsamples, each = 100))
+# 
+# ### Plot posterior predictive 
+# ggplot(post_pred_mod1 %>% filter(iter < 50)) +
+#   geom_density(aes(x = rt, group = iter)) + 
+#   theme_bw()
+
+```
+* Both posterior predictive checks for model 1 and 2 demonstrate that our models describe the data adequately. They capture the bimodal feature of the data.
+
+## C)
+```{r}
+### Rsquared for model 1
+bayes_R2(mod1)
+
+### Rsquared for model 2
+bayes_R2(mod2)
+```
+* The R-squared for both models are almost identical
+
+
+## D)
+```{r}
+### Run model with options "save_all_pars" to save prior samples along with posterior (for computing marginal likelihood after)
+mod1_fr_brdg <- brm(RTnaming ~ 1 + AgeSubject + WrittenFrequency.c, data = rts_dat,
+                   family = gaussian(),
+                   prior = priors,
+                   save_pars = save_pars(all = TRUE), # Needed to use bridge_sampler
+                   iter = 2000,
+                   chains = 4,
+                   cores = 4,
+                   warmup = 1000)
+
+### Run model with options "save_all_pars" to save prior samples along with posterior (for computing marginal likelihood after)
+mod2_fr_brdg <- brm(RTnaming ~ 1 + AgeSubject * WrittenFrequency.c, data = rts_dat,
+                   family = gaussian(),
+                   prior = priors,
+                   save_pars = save_pars(all = TRUE), # Needed to use bridge_sampler
+                   iter = 2000,
+                   chains = 4,
+                   cores = 4,
+                   warmup = 1000)
+
+### Compute marginal log likelihood for the two models
+margLoglik_mod1 <- bridge_sampler(mod1_fr_brdg, silent = T)
+margLoglik_mod2 <- bridge_sampler(mod2_fr_brdg, silent = T)
+
+### Compute Bayes Factor
+# (Manually) by taking ratio of the two log likelihood
+exp(margLoglik_mod1$logml - margLoglik_mod2$logml)
+# (With function)
+bayes_factor(margLoglik_mod1, margLoglik_mod2)
+
+```
+
+* The Bayes Factor of these models is a very small decimal number. Thus, there is strong evidence in favor of model 2 (model with the interaction) compared to model 1 (by an order of magnitude of 4)
+
+**Note: We did not check for the robustness of the Bayes factor under different prior specifications. if the qualitative conclusion did change across a range of different plausible prior distributions, this would indicate that the analysis is not robust** 
+
+
+#### 5)
+* Given that bayes factor is strongly in favor of model 2, I will choose model 2 to report the findings:
+
+```{r}
+### Plot 
+plot(mod2)
+summary(mod2)  
+rts_dat$AgeSubject %>% contrasts()
+```
+
+*  Given that the caterpillar plots and the density plots for each of the parameter in the diagnostic plots are respectively overlapping we can say that there is no evidence of non-convergence. Thus we can have some confidence in our estimates.
+
+* In addition, the posterior predictive (i.e. simulated and replicated data under the fitted model) capture fairly well (with ppcheck) the bimodality of the data. Thus, it can be assumed that the model gives us valid predictions about the reality.
+
+* For all parameters, the credibility intervals do not include zero, the Potential Reduction Scale Factors are below 1.05 and the effective sample sizes suggest that there is not too much redundancy/autocorrelation in the chains.
+
+* In the current model we see that:
+
+**Note: The term “main effect” is traditionally interpreted as the difference between levels of a given factor, collapsed across all other factors.**
+
+* When variable AgeSubject is dummy coded (i.e. 0,1): The estimate for the intercept is 6.15 [6.15; 6.15] **Note: The Credible interval is so small that it appears to be the same number as the estimate**. It represents the average value when all predictors variables are zero. This result indicates that the average reaction time estimate for young people in RT naming is about 6.15 second (everything else remaining constant).  
+
+* When variable AgeSubject is dummy coded (i.e. 0,1): The estimate for the AgeSubject is 0.34 [0.34; 0.34]. This result indicates that there is a simple (not main) effect of Age and that the average reaction time estimate for old people in RT naming is about 0.34 second slower on average than that of young people. 
+
+* The estimate for WrittenFrequency.c is -0.01 [-0.01; -0.01]. This result indicates that there is a simple (not main) effect of WrittenFrequency and that the average reaction time estimate in RT naming is about 0.01 second faster on average for one word increment in written frequency.
+
+* When variable AgeSubject is sum coded (i.e. -0.5, 0.5): The estimate for the intercept is 6.34 [6.34; 6.34] **Note: The Credible interval is so small that it appears to be the same number as the estimate**. It represents the grand mean reaction time. This result indicates that the grand mean reaction time estimate for young/old combined and all written words combined is about 6.34 second.  
+
+* When variable AgeSubject is sum coded (i.e. -0.5, 0.5), the estimate for the AgeSubject is 0.34 [0.34; 0.34]. This represent the deviation from the grand mean for "old" group level. (To get the old group take the opposite sign of the coeffients. Only works when variable has 2 levels). **Note: When there are only 2 levels in effect coding (or sum coding) the interpretation of the intercept changes from dummy coding, but the interpretation of the contrast’s regression coefficient does not changed.** This result indicates that there is a main effect of Age and that thee average reaction time estimate for old people in RT naming is about 0.34 second slower on average than that of young people . 
+
+* The estimate for WrittenFrequency.c is -0.01 [-0.01; -0.01]. This result indicates that there is a simple (not main) effect of WrittenFrequency and that the average reaction time estimate in RT naming is about 0.01 second faster on average for one word increment in written frequency . 
+
+* See [this article](https://rpubs.com/monajhzhu/608609) or [this one](https://stats.idre.ucla.edu/other/mult-pkg/faq/general/faq-how-do-i-interpret-the-coefficients-of-an-effect-coded-variable-involved-in-an-interaction-in-a-regression-model/) for the meaning of coefficient when effect coding is done
+
+```{r}
+# sessionInfo()
+```
+
